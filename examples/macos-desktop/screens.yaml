@@ -1,0 +1,21 @@
+schema: cmuitestapp://
+screens:
+  - name: propertiesPanel
+    path: properties-panel
+    states:
+      - name: default
+      - name: loading
+      - name: error
+        params:
+          - name: error_code
+            required: false
+            default: "500"
+
+  - name: connectionDetail
+    path: connection-detail
+    states:
+      - name: default
+        params:
+          - name: connection_id
+            required: true
+      - name: empty

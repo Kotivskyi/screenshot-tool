@@ -1,0 +1,439 @@
+#!/bin/bash
+# take_screenshot — Build, launch, navigate, and screenshot CMUITestApp scenes via deep link URLs
+# Fix CRLF line endings if the Write tool introduced them
+if [[ "$(head -c 20 "$0" | tr -cd '\r' | wc -c)" -gt 0 ]]; then
+    sed -i '' 's/\r$//' "$0"
+    exec "$0" "$@"
+fi
+set -euo pipefail
+
+# ── Repo & paths ──────────────────────────────────────────────────────────────
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
+if [[ -z "$REPO_ROOT" ]]; then
+    echo "Error: Not in a git repository"
+    exit 1
+fi
+
+SCREENS_YAML="$REPO_ROOT/screens.yaml"
+WORKSPACE="$REPO_ROOT/Delinea.ConnectionManager.Mac.ConnectionManagerUI/ConnectionManagerUI/ConnectionManagerUI.xcworkspace"
+SCHEME="CMUITestApp"
+CONFIG="Debug"
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+URL=""
+OUTPUT=""
+TIMEOUT_MS=3000
+NO_BUILD=false
+NO_RESTART=false
+
+# ── State variables ───────────────────────────────────────────────────────────
+LAUNCHED_BY_SCRIPT=false
+APP_PID=""
+EXECUTABLE=""
+
+# Resolved by python helper
+SCENE_NAME=""
+STATE_NAME=""
+PARAM_ARGS=""  # space-separated key=value pairs for --params
+
+# ── Cleanup trap ──────────────────────────────────────────────────────────────
+cleanup() {
+    if [[ "$LAUNCHED_BY_SCRIPT" == "true" && "$NO_RESTART" == "false" ]]; then
+        pkill -f CMUITestApp 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+# ── Python helper for YAML parsing and URL validation ─────────────────────────
+# Returns: SCENE_NAME STATE_NAME PARAM1=VAL1 PARAM2=VAL2 ...
+# Exits with code 2 and prints error on validation failure
+validate_url_py() {
+    local url="$1"
+    local yaml="$2"
+    python3 - "$url" "$yaml" <<'PYEOF'
+import sys, re
+from urllib.parse import urlparse, parse_qs
+
+url_str = sys.argv[1]
+yaml_path = sys.argv[2]
+
+# ── Parse YAML (simple structured parser, no PyYAML needed) ──
+screens = []
+try:
+    with open(yaml_path) as f:
+        lines = f.readlines()
+except FileNotFoundError:
+    print(f"Error: Screen registry not found at {yaml_path}", file=sys.stdout)
+    sys.exit(2)
+
+schema = ""
+current_screen = None
+current_state = None
+current_param = None
+
+for line in lines:
+    stripped = line.rstrip()
+    if not stripped or stripped.lstrip().startswith('#'):
+        continue
+    indent = len(line) - len(line.lstrip())
+
+    if stripped.startswith('schema:'):
+        schema = stripped.split(':', 1)[1].strip()
+    elif stripped.strip() == 'screens:':
+        pass
+    elif indent == 2 and '- name:' in stripped:
+        name = stripped.split('name:', 1)[1].strip()
+        current_screen = {'name': name, 'path': '', 'states': []}
+        screens.append(current_screen)
+        current_state = None
+        current_param = None
+    elif indent == 4 and 'path:' in stripped and current_screen:
+        current_screen['path'] = stripped.split('path:', 1)[1].strip()
+    elif indent == 4 and stripped.strip() == 'states:' and current_screen:
+        pass
+    elif indent == 6 and '- name:' in stripped and current_screen:
+        state_name = stripped.split('name:', 1)[1].strip()
+        current_state = {'name': state_name, 'params': []}
+        current_screen['states'].append(current_state)
+        current_param = None
+    elif indent == 8 and stripped.strip() == 'params:' and current_state:
+        pass
+    elif indent == 10 and '- name:' in stripped and current_state:
+        param_name = stripped.split('name:', 1)[1].strip()
+        current_param = {'name': param_name, 'required': False, 'default': None}
+        current_state['params'].append(current_param)
+    elif indent == 12 and 'required:' in stripped and current_param:
+        val = stripped.split('required:', 1)[1].strip()
+        current_param['required'] = val.lower() == 'true'
+    elif indent == 12 and 'default:' in stripped and current_param:
+        val = stripped.split('default:', 1)[1].strip().strip('"').strip("'")
+        current_param['default'] = val
+
+# ── Parse URL ──
+if '://' not in url_str:
+    print(f"Error: Invalid URL format: {url_str}")
+    sys.exit(2)
+
+url_schema = url_str.split('://')[0] + '://'
+remainder = url_str.split('://', 1)[1]
+
+if '?' in remainder:
+    url_path = remainder.split('?', 1)[0]
+    query_str = remainder.split('?', 1)[1]
+else:
+    url_path = remainder
+    query_str = ''
+
+# Parse query params
+params = {}
+state_param = ''
+if query_str:
+    for pair in query_str.split('&'):
+        if '=' in pair:
+            k, v = pair.split('=', 1)
+        else:
+            k, v = pair, ''
+        if k == 'state':
+            state_param = v
+        else:
+            params[k] = v
+
+# ── Validate ──
+if url_schema != schema:
+    print(f"Error: URL schema '{url_schema}' does not match registry schema '{schema}'")
+    sys.exit(2)
+
+# Find screen
+screen = None
+for s in screens:
+    if s['path'] == url_path:
+        screen = s
+        break
+
+if not screen:
+    paths = ', '.join(s['path'] for s in screens)
+    print(f"Error: Screen '{url_path}' is not registered. Use --help to see available screens.")
+    sys.exit(2)
+
+# Find state
+if not state_param:
+    if screen['states']:
+        state = screen['states'][0]
+    else:
+        print(f"Error: Screen '{url_path}' has no states defined")
+        sys.exit(2)
+else:
+    state = None
+    for st in screen['states']:
+        if st['name'] == state_param:
+            state = st
+            break
+    if not state:
+        valid = ', '.join(st['name'] for st in screen['states'])
+        print(f"Error: State '{state_param}' is not valid for screen '{url_path}'. Valid states: {valid}")
+        sys.exit(2)
+
+# Check required params
+for p in state['params']:
+    if p['required'] and p['name'] not in params:
+        print(f"Error: Required parameter '{p['name']}' missing for state '{state['name']}' of screen '{url_path}'")
+        sys.exit(2)
+
+# Apply defaults
+for p in state['params']:
+    if p['name'] not in params and p['default'] is not None:
+        params[p['name']] = p['default']
+
+# Output: scene_name\nstate_name\nkey=val\nkey=val...
+print(screen['name'])
+print(state['name'])
+for k, v in params.items():
+    print(f"{k}={v}")
+PYEOF
+}
+
+# ── help_screens_py() — print registered screens for --help ──────────────────
+help_screens_py() {
+    python3 - "$1" <<'PYEOF'
+import sys
+
+yaml_path = sys.argv[1]
+screens = []
+try:
+    with open(yaml_path) as f:
+        lines = f.readlines()
+except FileNotFoundError:
+    sys.exit(0)
+
+current_screen = None
+current_state = None
+current_param = None
+
+for line in lines:
+    stripped = line.rstrip()
+    if not stripped or stripped.lstrip().startswith('#'):
+        continue
+    indent = len(line) - len(line.lstrip())
+
+    if indent == 2 and '- name:' in stripped:
+        current_screen = {'name': stripped.split('name:', 1)[1].strip(), 'path': '', 'states': []}
+        screens.append(current_screen)
+        current_state = None
+        current_param = None
+    elif indent == 4 and 'path:' in stripped and current_screen:
+        current_screen['path'] = stripped.split('path:', 1)[1].strip()
+    elif indent == 6 and '- name:' in stripped and current_screen:
+        current_state = {'name': stripped.split('name:', 1)[1].strip(), 'params': []}
+        current_screen['states'].append(current_state)
+        current_param = None
+    elif indent == 10 and '- name:' in stripped and current_state:
+        current_param = {'name': stripped.split('name:', 1)[1].strip(), 'required': False, 'default': None}
+        current_state['params'].append(current_param)
+    elif indent == 12 and 'required:' in stripped and current_param:
+        current_param['required'] = stripped.split('required:', 1)[1].strip().lower() == 'true'
+    elif indent == 12 and 'default:' in stripped and current_param:
+        current_param['default'] = stripped.split('default:', 1)[1].strip().strip('"').strip("'")
+
+for s in screens:
+    print(f"  {s['path']}")
+    state_names = ', '.join(st['name'] for st in s['states'])
+    print(f"    States: {state_names}")
+    for st in s['states']:
+        for p in st['params']:
+            if p['required']:
+                ann = 'required'
+            elif p['default']:
+                ann = f"optional, default: \"{p['default']}\""
+            else:
+                ann = 'optional'
+            print(f"      {st['name']} -> {p['name']} ({ann})")
+PYEOF
+}
+
+# ── usage() ───────────────────────────────────────────────────────────────────
+usage() {
+    cat <<'USAGE_EOF'
+Usage: take_screenshot --url <deep_link_url> [OPTIONS]
+
+Options:
+  --url <url>         Deep link URL: {schema}{path}?state={state}&{params} (required)
+  --output <path>     Output screenshot path (default: ./screenshots/{datetime}_screenshot.png)
+  --timeout <ms>      Max wait time for screen to settle (default: 3000)
+  --no-build          Skip xcodebuild step
+  --no-restart        Keep app running after capture; reuse running instance if available
+  --help              Show this help
+USAGE_EOF
+
+    if [[ -f "$SCREENS_YAML" ]]; then
+        echo ""
+        echo "Registered Screens (from screens.yaml):"
+        echo ""
+        help_screens_py "$SCREENS_YAML"
+    fi
+    exit 0
+}
+
+# ── build_app() ───────────────────────────────────────────────────────────────
+build_app() {
+    # Find build directory
+    local build_dir
+    build_dir=$(xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" \
+        -configuration "$CONFIG" -showBuildSettings 2>/dev/null \
+        | grep -m1 " BUILD_DIR = " | awk '{print $NF}')
+    APP_PATH="$build_dir/$CONFIG/CMUITestApp.app"
+    EXECUTABLE="$APP_PATH/Contents/MacOS/CMUITestApp"
+
+    if [[ "$NO_BUILD" == "true" ]]; then
+        if [[ ! -f "$EXECUTABLE" ]]; then
+            echo "Error: App not built. Run without --no-build first, or build manually."
+            exit 1
+        fi
+        return
+    fi
+
+    echo "Building CMUITestApp..." >&2
+    if ! xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" \
+        -configuration "$CONFIG" build 2>&1 \
+        | grep -E "error:|BUILD " >&2; then
+        true  # grep returns 1 if no matches, but build may still succeed
+    fi
+
+    if [[ ! -f "$EXECUTABLE" ]]; then
+        echo "Error: Build failed — executable not found at $EXECUTABLE"
+        exit 1
+    fi
+}
+
+# ── launch_and_capture() ─────────────────────────────────────────────────────
+launch_and_capture() {
+    local timeout_sec
+    timeout_sec=$(awk "BEGIN {printf \"%.1f\", $TIMEOUT_MS / 1000}")
+
+    # Build CLI args for the app
+    local -a app_args=(--screenshot --scene "$SCENE_NAME" --output "$OUTPUT")
+
+    if [[ -n "$STATE_NAME" ]]; then
+        app_args+=(--state "$STATE_NAME")
+    fi
+
+    # Add params
+    if [[ -n "$PARAM_ARGS" ]]; then
+        while IFS= read -r parg; do
+            [[ -n "$parg" ]] && app_args+=(--params "$parg")
+        done <<< "$PARAM_ARGS"
+    fi
+
+    if [[ "$NO_RESTART" == "true" ]]; then
+        app_args+=(--no-exit)
+    fi
+
+    # Kill existing instance unless --no-restart
+    if [[ "$NO_RESTART" == "false" ]]; then
+        pkill -f CMUITestApp 2>/dev/null && sleep 0.5 || true
+    fi
+
+    # Delete output file to detect when new one is written
+    rm -f "$OUTPUT"
+
+    # Launch
+    LAUNCHED_BY_SCRIPT=true
+    "$EXECUTABLE" "${app_args[@]}" &
+    APP_PID=$!
+
+    # Wait for completion with timeout
+    local elapsed=0
+    local interval=0.2
+
+    if [[ "$NO_RESTART" == "true" ]]; then
+        # App won't exit — poll for output file
+        while (( $(awk "BEGIN {print ($elapsed < $timeout_sec) ? 1 : 0}") )); do
+            if [[ -f "$OUTPUT" ]] && [[ -s "$OUTPUT" ]]; then
+                return 0
+            fi
+            sleep "$interval"
+            elapsed=$(awk "BEGIN {printf \"%.1f\", $elapsed + $interval}")
+        done
+        echo "Error: Timeout — screenshot not produced within ${TIMEOUT_MS}ms"
+        exit 4
+    else
+        # App will exit — poll for process completion with timeout
+        while kill -0 "$APP_PID" 2>/dev/null; do
+            if (( $(awk "BEGIN {print ($elapsed >= $timeout_sec) ? 1 : 0}") )); then
+                kill "$APP_PID" 2>/dev/null || true
+                echo "Error: Timeout — app did not finish within ${TIMEOUT_MS}ms"
+                exit 4
+            fi
+            sleep "$interval"
+            elapsed=$(awk "BEGIN {printf \"%.1f\", $elapsed + $interval}")
+        done
+        local wait_result=0
+        wait "$APP_PID" 2>/dev/null || wait_result=$?
+
+        if [[ "$wait_result" -ne 0 ]]; then
+            echo "Error: App exited with code $wait_result"
+            exit 3
+        fi
+
+        if [[ ! -f "$OUTPUT" ]] || [[ ! -s "$OUTPUT" ]]; then
+            echo "Error: Screenshot file was not produced"
+            exit 3
+        fi
+    fi
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --url)        URL="$2"; shift 2 ;;
+        --output)     OUTPUT="$2"; shift 2 ;;
+        --timeout)    TIMEOUT_MS="$2"; shift 2 ;;
+        --no-build)   NO_BUILD=true; shift ;;
+        --no-restart) NO_RESTART=true; shift ;;
+        --help)       usage ;;
+        *)            echo "Error: Unknown option: $1"; exit 2 ;;
+    esac
+done
+
+# Require --url
+if [[ -z "$URL" ]]; then
+    echo "Error: --url is required. Use --help for usage."
+    exit 2
+fi
+
+# Validate URL against screens.yaml (python3 helper)
+# Output format: line1=scene_name, line2=state_name, line3+=key=value params
+validation_output=$(validate_url_py "$URL" "$SCREENS_YAML") || {
+    echo "$validation_output"
+    exit 2
+}
+SCENE_NAME=$(echo "$validation_output" | sed -n '1p')
+STATE_NAME=$(echo "$validation_output" | sed -n '2p')
+PARAM_ARGS=$(echo "$validation_output" | sed -n '3,$p')
+
+# Generate default output path if not specified
+if [[ -z "$OUTPUT" ]]; then
+    screenshots_dir="$REPO_ROOT/screenshots"
+    mkdir -p "$screenshots_dir"
+    OUTPUT="$screenshots_dir/$(date +%Y%m%d_%H%M%S)_$(python3 -c 'import time; print(int(time.time()*1000)%1000000)')_screenshot.png"
+fi
+
+# Make output path absolute
+if [[ "$OUTPUT" != /* ]]; then
+    parent_dir="$(cd "$(dirname "$OUTPUT")" 2>/dev/null && pwd)"
+    OUTPUT="$parent_dir/$(basename "$OUTPUT")"
+fi
+
+# Create output parent directory
+mkdir -p "$(dirname "$OUTPUT")"
+
+# Build
+build_app
+
+# Capture
+launch_and_capture
+
+# Success
+echo "$OUTPUT"
+exit 0

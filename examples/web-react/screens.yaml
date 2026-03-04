@@ -1,0 +1,115 @@
+schema: "myapp://"
+
+screens:
+  - name: login
+    path: /login
+    auth: false
+    states:
+      - name: default
+      - name: error
+
+  - name: dashboard
+    path: /dashboard
+    auth: true
+    states:
+      - name: default
+      - name: loading
+      - name: error
+      - name: empty
+
+  - name: slots
+    path: /slots
+    auth: true
+    states:
+      - name: default
+      - name: loading
+      - name: error
+      - name: empty
+
+  - name: slot-create
+    path: /slots/create
+    auth: true
+    states:
+      - name: default
+
+  - name: slot-details
+    path: /slots/:id
+    auth: true
+    states:
+      - name: default
+        params:
+          - name: id
+            required: true
+      - name: loading
+        params:
+          - name: id
+            required: true
+      - name: error
+        params:
+          - name: id
+            required: true
+
+  - name: slot-edit
+    path: /slots/:id/edit
+    auth: true
+    states:
+      - name: default
+        params:
+          - name: id
+            required: true
+      - name: loading
+        params:
+          - name: id
+            required: true
+
+  - name: bookings
+    path: /bookings
+    auth: true
+    states:
+      - name: default
+      - name: loading
+      - name: error
+      - name: empty
+
+  - name: booking-details
+    path: /bookings/:id
+    auth: true
+    states:
+      - name: default
+        params:
+          - name: id
+            required: true
+      - name: loading
+        params:
+          - name: id
+            required: true
+      - name: error
+        params:
+          - name: id
+            required: true
+
+  - name: users
+    path: /users
+    auth: true
+    states:
+      - name: default
+      - name: loading
+      - name: error
+      - name: empty
+
+  - name: user-details
+    path: /users/:id
+    auth: true
+    states:
+      - name: default
+        params:
+          - name: id
+            required: true
+      - name: loading
+        params:
+          - name: id
+            required: true
+      - name: error
+        params:
+          - name: id
+            required: true
